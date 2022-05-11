@@ -1,0 +1,613 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Default: "your_s3_bucket"
+    Description: "The S3 bucket that has the Lambda code that is also accessible from this AWS account."
+
+Resources:
+    DeviceSimulatorLambda:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            FunctionName: "Device_Simulator"
+            Handler: "Device_Simulator.lambda_handler"
+            Code: 
+                S3Bucket: 
+                    Ref: S3BucketName
+                S3Key: "Device_Simulator.zip"
+            Role: !GetAtt DeviceSimulatorIAMRole.Arn
+            Runtime: "python3.8"
+            Timeout: 600
+
+    DeviceSimulatorIAMRole:
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: /
+            RoleName: "Device_Simulator_Role"
+            AssumeRolePolicyDocument: 
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      Service:
+                        - lambda.amazonaws.com
+                    Action:
+                      - 'sts:AssumeRole'
+            Policies:
+              - PolicyName: Device_Simulator_Policy
+                PolicyDocument:
+                  Version: '2012-10-17'
+                  Statement:
+                    - Effect: Allow
+                      Action: 'iot:Publish'
+                      Resource: !Sub 'arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:*'
+            ManagedPolicyArns: 
+              - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+    DeviceSimulatorEventBridgeRule:
+        Type: "AWS::Events::Rule"
+        Properties:
+            Name: "DeviceSimulatorTrigger"
+            ScheduleExpression: "rate(10 minutes)"
+            State: "ENABLED"
+            Targets: 
+              - 
+                Arn: !GetAtt DeviceSimulatorLambda.Arn
+                Id: "DeviceSimulatorLambda"
+
+    EventBridgeLambdaPermission:
+        Type: "AWS::Lambda::Permission"
+        Properties:
+            Action: "lambda:InvokeFunction"
+            FunctionName: !Ref DeviceSimulatorLambda
+            Principal: "events.amazonaws.com"
+            SourceArn: !GetAtt DeviceSimulatorEventBridgeRule.Arn
+
+    DeviceInputIoTEvents:
+        Type: "AWS::IoTEvents::Input"
+        Properties:
+            InputDefinition: 
+                Attributes: 
+                  - 
+                    JsonPath: "device_id"
+                  - 
+                    JsonPath: "time_seconds"
+                  - 
+                    JsonPath: "gas_reading"
+                  - 
+                    JsonPath: "latitude"
+                  - 
+                    JsonPath: "longitude"
+            InputName: "Device_Data"
+
+    DeviceMessageToEventsIoTRule:
+        Type: AWS::IoT::TopicRule
+        Properties:
+          RuleName: "Device_Message_to_Events"
+          TopicRulePayload:
+            RuleDisabled: false
+            Sql: SELECT * FROM 'Device_Simulator/telemetry'
+            Actions:
+              - IotEvents:
+                  InputName: !Ref DeviceInputIoTEvents
+                  RoleArn: !GetAtt DeviceMessageToEventsIoTRuleIAMRole.Arn
+
+    DeviceMessageToEventsIoTRuleIAMRole:
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: /
+            RoleName: "Device_Message_to_Events_Role"
+            AssumeRolePolicyDocument: 
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      Service:
+                        - iot.amazonaws.com
+                    Action:
+                      - 'sts:AssumeRole'
+            Policies:
+              - PolicyName: Device_Message_to_Events_Policy
+                PolicyDocument:
+                  Statement:
+                    - Effect: Allow
+                      Action: 'iotevents:BatchPutMessage'
+                      Resource: !Sub 'arn:${AWS::Partition}:iotevents:${AWS::Region}:${AWS::AccountId}:input/${DeviceInputIoTEvents}'
+
+    ModelIoTEvents:
+      Type: "AWS::IoTEvents::DetectorModel"
+      Properties:
+        DetectorModelName: Device_Status
+        EvaluationMethod: BATCH
+        Key: device_id
+        RoleArn: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${IoTEventsIAMRole}"
+        DetectorModelDefinition:
+          States:
+            - StateName: Offline
+              OnInput:
+                Events: []
+                TransitionEvents:
+                  - EventName: TurnOn
+                    Condition: >-
+                      $input.Device_Data.gas_reading > 0 &&
+                      $input.Device_Data.gas_reading < $variable.AlarmThreshold
+                    Actions:
+                      - ResetTimer:
+                          TimerName: IdleTimer
+                    NextState: Online
+                  - EventName: EnterAlarmState
+                    Condition: $input.Device_Data.gas_reading >= $variable.AlarmThreshold
+                    Actions: []
+                    NextState: Alarm
+              OnEnter:
+                Events:
+                  - EventName: StartIdleTimer
+                    Condition: 'true'
+                    Actions:
+                      - SetTimer:
+                          TimerName: IdleTimer
+                          Seconds: 60
+                  - EventName: SetAlarmThreshold
+                    Condition: 'true'
+                    Actions:
+                      - SetVariable:
+                          VariableName: AlarmThreshold
+                          Value: '500'
+              OnExit:
+                Events: []
+            - StateName: Online
+              OnInput:
+                Events:
+                  - EventName: ResetIdleTimer
+                    Condition: 'true'
+                    Actions:
+                      - ResetTimer:
+                          TimerName: IdleTimer
+                TransitionEvents:
+                  - EventName: EnterAlarmState
+                    Condition: $input.Device_Data.gas_reading >= $variable.AlarmThreshold
+                    Actions: []
+                    NextState: Alarm
+                  - EventName: TurnOff
+                    Condition: timeout("IdleTimer")
+                    Actions: []
+                    NextState: Offline
+              OnEnter:
+                Events: []
+              OnExit:
+                Events: []
+            - StateName: Alarm
+              OnInput:
+                Events:
+                  - EventName: ResetIdleTimer
+                    Condition: 'true'
+                    Actions:
+                      - ResetTimer:
+                          TimerName: IdleTimer
+                TransitionEvents:
+                  - EventName: ExitAlarmState
+                    Condition: $input.Device_Data.gas_reading < $variable.AlarmThreshold
+                    Actions: []
+                    NextState: Online
+                  - EventName: TurnOff
+                    Condition: timeout("IdleTimer")
+                    Actions: []
+                    NextState: Offline
+              OnEnter:
+                Events: []
+              OnExit:
+                Events: []
+          InitialStateName: Offline
+
+
+
+    IoTEventsIAMRole:
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: /
+            RoleName: "Device_Events_Role"
+            AssumeRolePolicyDocument: 
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      Service:
+                        - iotevents.amazonaws.com
+                    Action:
+                      - 'sts:AssumeRole'
+            Policies:
+              - PolicyName: Device_Events_Policy
+                PolicyDocument:
+                  Statement:
+                    Effect: Allow
+                    Action: 'iotevents:BatchPutMessage'
+                    Resource: !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:input/*'
+
+    SqsQueue:
+        Type: "AWS::SQS::Queue"
+        Properties:
+            QueueName: "Device_IoT_Queue"
+            
+    SQSQueuePolicy:
+        Type: "AWS::SQS::QueuePolicy"
+        Properties:
+            PolicyDocument: 
+                Version: '2008-10-17'
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+                    Action: 'SQS:*'
+                    Resource: !Ref SqsQueue
+            Queues: 
+              - !Sub "https://sqs.${AWS::Region}.amazonaws.com/${AWS::AccountId}/${SqsQueue.QueueName}"
+
+
+
+    DeviceMessageToSQSIoTRule:
+        Type: AWS::IoT::TopicRule
+        Properties:
+          RuleName: "Device_Message_to_SQS"
+          TopicRulePayload:
+            RuleDisabled: false
+            Sql: SELECT * FROM 'Device_Simulator/telemetry'
+            Actions:
+              - Sqs:
+                  QueueUrl: !Sub "https://sqs.${AWS::Region}.amazonaws.com/${AWS::AccountId}/${SqsQueue.QueueName}"
+                  RoleArn: !GetAtt DeviceMessageToSQSIoTRuleIAMRole.Arn
+
+    DeviceMessageToSQSIoTRuleIAMRole:
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: /
+            RoleName: "Device_Message_to_SQS_Role"
+            AssumeRolePolicyDocument: 
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      Service:
+                        - iot.amazonaws.com
+                    Action:
+                      - 'sts:AssumeRole'
+            Policies:
+              - PolicyName: Device_Simulator_Policy
+                PolicyDocument:
+                  Statement:
+                    Effect: Allow
+                    Action: 'sqs:SendMessage'
+                    Resource: !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${SqsQueue.QueueName}'
+        
+
+    DeviceSQSProcessingLambda:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            FunctionName: "Device_SQS_Processing"
+            Handler: "Device_SQS_Processing.lambda_handler"
+            Code: 
+                S3Bucket: 
+                    Ref: S3BucketName
+                S3Key: "Device_SQS_Processing.zip"
+            Role: !GetAtt DeviceSQSProcessingIAMRole.Arn
+            Runtime: "python3.8"
+            Timeout: 30
+
+
+
+    DeviceSQSProcessingIAMRole:
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: /
+            RoleName: "Device_SQS_Processing_Role"
+            AssumeRolePolicyDocument: 
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      Service:
+                        - lambda.amazonaws.com
+                    Action:
+                      - 'sts:AssumeRole'
+            Policies:
+              - PolicyName: Device_SQS_Processing_Policy
+                PolicyDocument:
+                  Version: '2012-10-17'
+                  Statement:
+                    - Effect: Allow
+                      Action: 'geo:BatchUpdateDevicePosition'
+                      Resource: !Sub 'arn:${AWS::Partition}:geo:${AWS::Region}:${AWS::AccountId}:tracker/*'
+
+            MaxSessionDuration: 3600
+            ManagedPolicyArns: 
+              - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+              - "arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole"
+              - "arn:aws:iam::aws:policy/AmazonTimestreamFullAccess"
+
+    LambdaEventSourceMapping:
+        Type: "AWS::Lambda::EventSourceMapping"
+        Properties:
+            EventSourceArn: !GetAtt SqsQueue.Arn
+            FunctionName: !GetAtt DeviceSQSProcessingLambda.Arn
+
+    TimestreamDB:
+        Type: AWS::Timestream::Database
+        Properties: 
+            DatabaseName: "Device_Time_DB"
+    
+    TimestreamTable:
+        Type: AWS::Timestream::Table
+        Properties: 
+            DatabaseName: !Ref TimestreamDB
+            TableName: "Positions"
+    
+    
+    CognitoIdentityPoolLocationServices:
+        Type: "AWS::Cognito::IdentityPool"
+        Properties:
+            IdentityPoolName: "Device_Map_ID_Pool"
+            AllowUnauthenticatedIdentities: true
+
+    CognitoIdentityPoolLocationServicesRoleAttachment:
+        Type: "AWS::Cognito::IdentityPoolRoleAttachment"
+        Properties:
+            IdentityPoolId: !Sub "${CognitoIdentityPoolLocationServices}"
+            Roles: 
+                authenticated: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${CognitoAuthIAMRole}"
+                unauthenticated: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${CognitoUnauthIAMRole}"
+
+    CognitoUnauthIAMRole:
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: /
+            RoleName: "Map_Cognito_Unauth_Role"
+            AssumeRolePolicyDocument: 
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      Federated: cognito-identity.amazonaws.com
+                    Action: 'sts:AssumeRoleWithWebIdentity'
+                    Condition:
+                      StringEquals:
+                        'cognito-identity.amazonaws.com:aud': !Sub '${CognitoIdentityPoolLocationServices}'
+                      'ForAnyValue:StringLike':
+                        'cognito-identity.amazonaws.com:amr': unauthenticated
+            Policies:
+              - PolicyName: Map_Cognito_Unauth_Policy
+                PolicyDocument:
+                    Statement:
+                      - Sid: EventsLogging
+                        Effect: Allow
+                        Action:
+                          - 'mobileanalytics:PutEvents'
+                          - 'cognito-sync:*'
+                        Resource: '*'
+                      - Sid: MapsReadOnly
+                        Effect: Allow
+                        Action: 'geo:GetMap*'
+                        Resource: !Sub 'arn:${AWS::Partition}:geo:${AWS::Region}:${AWS::AccountId}:map/Device_Map'
+                      - Sid: UpdateDevicePosition
+                        Effect: Allow
+                        Action:
+                          - 'geo:BatchUpdateDevicePosition'
+                        Resource: !Sub 'arn:${AWS::Partition}:geo:${AWS::Region}:${AWS::AccountId}:tracker/Device_Tracker'
+
+    CognitoAuthIAMRole:
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: /
+            RoleName: "Map_Cognito_Auth_Role"
+            AssumeRolePolicyDocument: 
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      Federated: cognito-identity.amazonaws.com
+                    Action: 'sts:AssumeRoleWithWebIdentity'
+                    Condition:
+                      StringEquals:
+                        'cognito-identity.amazonaws.com:aud': !Sub '${CognitoIdentityPoolLocationServices}'
+                      'ForAnyValue:StringLike':
+                        'cognito-identity.amazonaws.com:amr': authenticated
+            Policies:
+              - PolicyName: Map_Cognito_Auth_Policy
+                PolicyDocument:
+                    Statement:
+                      - Effect: Allow
+                        Action:
+                          - 'mobileanalytics:PutEvents'
+                          - 'cognito-sync:*'
+                          - 'cognito-identity:*'
+                        Resource:
+                          - '*'
+
+    DeviceTrackerLocation:
+        Type: AWS::Location::Tracker
+        Properties: 
+            PricingPlan: "RequestBasedUsage"
+            TrackerName: "Device_Tracker"
+
+    MapLocation:
+        Type: "AWS::Location::Map"
+        Properties: 
+            Configuration: 
+                 Style: "VectorEsriStreets"
+            MapName: "Device_Map"
+            PricingPlan: "RequestBasedUsage"
+
+    DeviceLocationHistorytoGeoJSONLambda:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            FunctionName: "Device_Location_History_to_GeoJSON"
+            Handler: "Device_Location_History_to_GeoJSON.lambda_handler"
+            Code: 
+                S3Bucket: 
+                    Ref: S3BucketName
+                S3Key: "Device_Location_History_to_GeoJSON.zip"
+            Role: !GetAtt DeviceLocationHistorytoGeoJSONIAMRole.Arn
+            Runtime: "python3.8"
+            Timeout: 30
+
+    DeviceLocationHistorytoGeoJSONIAMRole:
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: /
+            RoleName: "Device_Location_History_to_GeoJSON_Role"
+            AssumeRolePolicyDocument: 
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      Service:
+                        - lambda.amazonaws.com
+                    Action:
+                      - 'sts:AssumeRole'
+            MaxSessionDuration: 3600
+            ManagedPolicyArns: 
+              - "arn:aws:iam::aws:policy/AmazonTimestreamReadOnlyAccess"
+              - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+    DeviceLocationtoGeoJSONLambda:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            FunctionName: "Device_Location_to_GeoJSON"
+            Handler: "Device_Location_to_GeoJSON.lambda_handler"
+            Code: 
+                S3Bucket: 
+                    Ref: S3BucketName
+                S3Key: "Device_Location_to_GeoJSON.zip"
+            Role: !GetAtt DeviceLocationtoGeoJSONIAMRole.Arn
+            Runtime: "python3.8"
+            Timeout: 30
+
+
+    DeviceLocationtoGeoJSONIAMRole:
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: /
+            RoleName: "Device_Location_to_GeoJSON_Role"
+            AssumeRolePolicyDocument: 
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      Service:
+                        - lambda.amazonaws.com
+                    Action:
+                      - 'sts:AssumeRole'
+            Policies:
+              - PolicyName: Device_Location_to_GeoJSON_Policy
+                PolicyDocument:
+                  Version: '2012-10-17'
+                  Statement:
+                    - Effect: Allow
+                      Action:
+                        - 'geo:BatchGetDevicePosition'
+                        - 'geo:GetDevicePositionHistory'
+                        - 'geo:GetDevicePosition'
+                        - 'geo:ListDevicePositions'
+                        - 'geo:ListTrackers'
+                      Resource: !Sub 'arn:${AWS::Partition}:geo:${AWS::Region}:${AWS::AccountId}:tracker/*'
+            MaxSessionDuration: 3600
+            ManagedPolicyArns: 
+              - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+    HTTPAPIAPIGateway:
+        Type: "AWS::ApiGatewayV2::Api"
+        Properties:
+            Name: "Device_Map_API"
+            ProtocolType: "HTTP"
+            RouteSelectionExpression: "$request.method $request.path"
+            CorsConfiguration: 
+                AllowCredentials: false
+                AllowOrigins: 
+                  - "*"
+                MaxAge: 0
+            DisableExecuteApiEndpoint: false
+
+    StageAPIGateway:
+        Type: "AWS::ApiGatewayV2::Stage"
+        Properties:
+            StageName: "$default"
+            ApiId: !Ref HTTPAPIAPIGateway
+            AutoDeploy: true
+
+    GetLocationRouteAPIGateway:
+        Type: "AWS::ApiGatewayV2::Route"
+        Properties:
+            ApiId: !Ref HTTPAPIAPIGateway
+            AuthorizationType: "NONE"
+            RequestParameters: {}
+            RouteKey: "GET /Get_Device_Location"
+            Target: !Sub "integrations/${DeviceGetLocationIntegrationAPIGateway}"
+
+    GetLocationHistoryRouteAPIGateway:
+        Type: "AWS::ApiGatewayV2::Route"
+        Properties:
+            ApiId: !Ref HTTPAPIAPIGateway
+            AuthorizationType: "NONE"
+            RouteKey: "GET /Get_Device_Location_History"
+            Target: !Sub "integrations/${DeviceGetLocationHistoryIntegrationAPIGateway}"
+
+    DeviceGetLocationIntegrationAPIGateway:
+        Type: "AWS::ApiGatewayV2::Integration"
+        Properties:
+            ApiId: !Ref HTTPAPIAPIGateway
+            ConnectionType: "INTERNET"
+            IntegrationMethod: "POST"
+            IntegrationType: "AWS_PROXY"
+            IntegrationUri: !GetAtt DeviceLocationtoGeoJSONLambda.Arn
+            TimeoutInMillis: 30000
+            PayloadFormatVersion: "2.0"
+
+    DeviceGetLocationHistoryIntegrationAPIGateway:
+        Type: "AWS::ApiGatewayV2::Integration"
+        Properties:
+            ApiId: !Ref HTTPAPIAPIGateway
+            ConnectionType: "INTERNET"
+            IntegrationMethod: "POST"
+            IntegrationType: "AWS_PROXY"
+            IntegrationUri: !GetAtt DeviceLocationHistorytoGeoJSONLambda.Arn
+            TimeoutInMillis: 30000
+            PayloadFormatVersion: "2.0"
+
+    DeviceLocationHistoryAPIGatewayLambdaPermissions:
+        Type: "AWS::Lambda::Permission"
+        Properties:
+            Action: "lambda:InvokeFunction"
+            FunctionName: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${DeviceLocationHistorytoGeoJSONLambda}"
+            Principal: "apigateway.amazonaws.com"
+            SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HTTPAPIAPIGateway}/*/*/Get_Device_Location_History"
+
+    DeviceLocationAPIGatewayLambdaPermissions:
+        Type: "AWS::Lambda::Permission"
+        Properties:
+            Action: "lambda:InvokeFunction"
+            FunctionName: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${DeviceLocationtoGeoJSONLambda}"
+            Principal: "apigateway.amazonaws.com"
+            SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HTTPAPIAPIGateway}/*/*/Get_Device_Location"
+
+
+
+Outputs:
+    ApiEndpoint:
+        Description: "API URL needed for frontend, copy this"
+        Value: !GetAtt HTTPAPIAPIGateway.ApiEndpoint
+    CognitoID:
+        Description: "Cognito ID needed for frontend, copy this"
+        Value: !Ref CognitoIdentityPoolLocationServices
+    IoTTest:
+        Description: "Link to IoT MQTT Test Client, topic to subscribe to is Device_Simulator/telemetry"
+        Value: "https://console.aws.amazon.com/iot/home?region=us-east-1#/test"
+    Amplify:
+        Description: "Link to Amplify Console"
+        Value: "https://console.aws.amazon.com/amplify/home?region=us-east-1#/"
+    EventBridge:
+        Description: "Link to EventBridge Rules Console"
+        Value: "https://console.aws.amazon.com/events/home?region=us-east-1#/rules"
+    IoTEvents:
+        Description: "Link to IoT Events Console"
+        Value: "https://console.aws.amazon.com/iotevents/home?region=us-east-1#/detectormodel"
+        
+
