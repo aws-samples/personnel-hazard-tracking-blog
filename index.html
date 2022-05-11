@@ -2,7 +2,7 @@
 <!-- SPDX-License-Identifier: MIT-0 -->
 <meta content="text/html;charset=utf-8" http-equiv="Content-Type">
 <meta content="utf-8" http-equiv="encoding">
-<html>
+<html> 
     <head>
         <link href="https://unpkg.com/maplibre-gl@1.15.2/dist/maplibre-gl.css" rel="stylesheet" />
         <style>
@@ -11,36 +11,50 @@
             }
 
             #map {
-                height: calc(100vh - 87px);
+                height: calc(100vh - 150px);
                 width: 100%;
             }
         </style>
     </head>
   
-    <body>
-        <table width="100%" height="100%" position = "absolute" border = "0" cellspacing="0" cellpadding="0">
+    <body style="font-family:arial;">
+        <table width="100%" height="100%" position = "absolute" border = "0" cellspacing="2" cellpadding="2">
             <tr height = 25>
-                <td colspan = "2" bgcolor = "IndianRed">
+                <td style="background-color:darkred; color:white;" colspan = "2">
                     <center>
                         <h1>Personnel Hazard Tracking</h1>
                     </center>
                 </td>
             </tr>
             <tr valign = "top">
-                <td bgcolor = "Silver" width = "25%">
-                    <b>Input Parameters</b><br><br>
+                <td style="background-color:Silver; color:black;" width = "25%">
+                    <b>Input Parameters</b><br>
+                    <br>
+                    Please copy and paste the API Endpoint URL and Congito User Pool ID into the fields below.  They are in the outputs of the CloudFormation.<br>
+                    <br>
                     <form id="form" onsubmit="return false;">
-                        Enter API Gateway URL:<br>
-                        <input style="width:100%;" type="text" id="ApiInput" /><br>
-                        Enter Congito User Pool ID:<br>
-                        <input style="width:100%;" type="text" id="CognitoInput" /><br>
+                        API Endpoint URL:<br>
+                        <input style="width:100%;" type="text" placeholder="https://1234567890.execute-api.us-east-1.amazonaws.com" id="ApiInput" /><br>
                         <br>
-                        <input style="width:100%;" type="submit" onclick="enterParams();" />
+                        Congito User Pool ID:<br>
+                        <input style="width:100%;" type="text" placeholder="us-east-1:12345678-1234-1234-1234-1234567890" id="CognitoInput" /><br>
+                        <br>
+                        <input style="width:100%;" type="submit" value="Start Map" onclick="enterParams();" /><br>
+                        <br>
+                        Note: Please refresh page if submitted incorrectly.<br>
                     </form>
+                    <br><br><br>
+                    <b>Useful Links:</b><br>
+                    <br>
+                    <a href="https://console.aws.amazon.com/events/home?region=us-east-1#/rules">EventBridge Rules Link</a><br>
+                    <a href="https://console.aws.amazon.com/iot/home?region=us-east-1#/test">IoT MQTT Test Client</a><br>
+                    <a href="https://console.aws.amazon.com/iotevents/home?region=us-east-1#/detectormodel">IoT Events Detector Models</a><br>
+                    <a href="https://console.aws.amazon.com/amplify/home?region=us-east-1#/">Amplify Console</a><br>
+                    <br>
                     
                 </td>
             
-                <td bgcolor = "Silver" width = "75%">
+                <td style="background-color:white;" width = "75%">
                     <div id="map" />
                     <script src="https://unpkg.com/maplibre-gl@1.15.2/dist/maplibre-gl.js"></script>
                     <script src="https://sdk.amazonaws.com/js/aws-sdk-2.784.0.min.js"></script>
@@ -50,33 +64,37 @@
                         
                         var url_device_base = '';
                         var identityPoolId = '';
+                        var credentials = '';
                         
+                        // Comfirm form data
                         function enterParams() {
                             url_device_base = document.getElementById("ApiInput").value;
                             identityPoolId = document.getElementById("CognitoInput").value;
+                            // extract the region from the Identity Pool ID
+                            AWS.config.region = identityPoolId.split(":")[0];
                             // alert(url_device_base + ' !!! ' + identityPoolId);
-                            alert('Parameters Updated!');
+                            //alert('Parameters Updated!');
+                            getCredentials();
+                            initializeMap();
                         }
                         
                         
                         // use Signer from @aws-amplify/core
-                        const { Signer } = window.aws_amplify_core;
+                        const {Signer} = window.aws_amplify_core;
     
-                        // configuration
                         // Amazon Location Service Map Name
                         const mapName = "Device_Map";
     
-                        // extract the region from the Identity Pool ID
-                        AWS.config.region = identityPoolId.split(":")[0];
     
+                
                         // instantiate a credential provider
-                        const credentials = new AWS.CognitoIdentityCredentials({
-                        IdentityPoolId: identityPoolId,
-                        });
-    
-                        /**
-                        * Sign requests made by Mapbox GL using AWS SigV4.
-                        */
+                        function getCredentials() {
+                            console.log("Test");
+                            credentials = new AWS.CognitoIdentityCredentials({IdentityPoolId: identityPoolId});
+                        }
+                        
+
+                        // Sign requests made by Mapbox GL using AWS SigV4.
                         function transformRequest(url, resourceType) {
                         if (resourceType === "Style" && !url.includes("://")) {
                             // resolve to an AWS URL
@@ -102,120 +120,119 @@
                         // Initialize a map.
                         //
                         async function initializeMap() {
-                        // load credentials and set them up to refresh
-                        await credentials.getPromise();
-    
-                        // actually initialize the map
-                        const map = new maplibregl.Map({
-                            container: "map",
-                            center: [-95.23145, 29.71951], // initial map centerpoint
-                            zoom: 16, // initial map zoom
-                            style: mapName,
-                            transformRequest,
-                        });
-    
-                        map.addControl(new maplibregl.NavigationControl(), "top-left");
-                        
-                        var url_device_pos = url_device_base + '/Gas_Detector_Get_Location'; 
-                        var url_device_trail = url_device_base + '/Gas_Detector_Get_Location_History'; 
-                        var url_device_trail_params = "duration=1200"; // How long trails should be in seconds since recorded
-                        url_device_trail = url_device_trail+"?"+url_device_trail_params;
-                        
-                        map.on('load', function () {
-                        
-                            var request1 = new XMLHttpRequest();
-                            var request2 = new XMLHttpRequest();
-                            
-                            
-                            // Add a data sources.
-                            map.addSource('device_pos', {type: 'geojson', data: url_device_pos});
-                            map.addSource('device_trail', {type: 'geojson', data: url_device_trail});
-                            
-                            // Repeating functions
-                            window.setInterval(function () {
-                            // make a GET request to parse the GeoJSON from current device positions
-                            request1.open('GET', url_device_pos, true);
-                            request1.onload = function () {
-                                if (this.status >= 200 && this.status < 400) {
-                                var json = JSON.parse(this.response);
-                                //console.log(json.features)
-                                
-                                // update the device symbols on the map
-                                map.getSource('device_pos').setData(json);
-                                }
-                            };
-                            request1.send();
-    
-                            // make a GET request to parse the GeoJSON from the device trails
-                            request2.open('GET', url_device_trail, true);
-                            request2.onload = function () {
-                                if (this.status >= 200 && this.status < 400) {
-                                var json = JSON.parse(this.response);
-                                //console.log(json.features)
-                                
-                                // update the device trails on the map
-                                map.getSource('device_trail').setData(json);
-                                }
-                            };
-                            request2.send();
-                            }, 5000);
-    
-    
-                            // Add a layer to represent the trail data.
-                            map.addLayer({
-                            'id': 'device_trail_layer',
-                            'type': 'circle',
-                            'source': 'device_trail', // reference the data source
-                            'paint': {
-                                // make circles larger as the user zooms from z12 to z22
-                                'circle-radius': {
-                                'base': 1.75,
-                                'stops': [
-                                    [12, 3],
-                                    [22, 50]
-                                ]
-                                },
-                                'circle-color': [
-                                'interpolate',
-                                ['linear'],
-                                ['get', 'gas_reading'],
-                                100,
-                                '#00FF00',
-                                1000,
-                                '#FF0000'
-                                ]
-                            }
+                            // load credentials and set them up to refresh
+                            await credentials.getPromise();
+        
+                            // actually initialize the map
+                            const map = new maplibregl.Map({
+                                container: "map",
+                                center: [-95.23145, 29.71951], // initial map centerpoint
+                                zoom: 16, // initial map zoom
+                                style: mapName,
+                                transformRequest,
                             });
-    
-                            // Add a layer to represent the device position data.
-                            map.addLayer({
-                            'id': 'device_pos_layer',
-                            'type': 'circle',
-                            'source': 'device_pos', // reference the data source
-                            'paint': {
-                                // make circles larger as the user zooms from z12 to z22
-                                'circle-radius': {
-                                'base': 1.75,
-                                'stops': [
-                                    [12, 3],
-                                    [22, 50]
-                                ]
-                                },
-                                'circle-color': '#0000FF'
-                            }
-                            });
+        
+                            map.addControl(new maplibregl.NavigationControl(), "top-left");
                             
-                        });
+                            var url_device_pos = url_device_base + '/Get_Device_Location'; 
+                            var url_device_trail = url_device_base + '/Get_Device_Location_History'; 
+                            var url_device_trail_params = "duration=1200"; // How long trails should be in seconds since recorded
+                            url_device_trail = url_device_trail+"?"+url_device_trail_params;
+                            
+                            map.on('load', function () {
+                            
+                                var request1 = new XMLHttpRequest();
+                                var request2 = new XMLHttpRequest();
+                                
+                                
+                                // Add a data sources.
+                                map.addSource('device_pos', {type: 'geojson', data: url_device_pos});
+                                map.addSource('device_trail', {type: 'geojson', data: url_device_trail});
+                                
+                                // Repeating functions
+                                window.setInterval(function () {
+                                // make a GET request to parse the GeoJSON from current device positions
+                                request1.open('GET', url_device_pos, true);
+                                request1.onload = function () {
+                                    if (this.status >= 200 && this.status < 400) {
+                                    var json = JSON.parse(this.response);
+                                    //console.log(json.features)
+                                    
+                                    // update the device symbols on the map
+                                    map.getSource('device_pos').setData(json);
+                                    }
+                                };
+                                request1.send();
+        
+                                // make a GET request to parse the GeoJSON from the device trails
+                                request2.open('GET', url_device_trail, true);
+                                request2.onload = function () {
+                                    if (this.status >= 200 && this.status < 400) {
+                                    var json = JSON.parse(this.response);
+                                    //console.log(json.features)
+                                    
+                                    // update the device trails on the map
+                                    map.getSource('device_trail').setData(json);
+                                    }
+                                };
+                                request2.send();
+                                }, 5000);
+        
+        
+                                // Add a layer to represent the trail data.
+                                map.addLayer({
+                                    'id': 'device_trail_layer',
+                                    'type': 'circle',
+                                    'source': 'device_trail', // reference the data source
+                                    'paint': {
+                                        // make circles larger as the user zooms from z12 to z22
+                                        'circle-radius': {
+                                        'base': 1.75,
+                                        'stops': [
+                                                [12, 3],
+                                                [22, 50]
+                                            ]
+                                        },
+                                        'circle-color': [
+                                            'interpolate',
+                                            ['linear'],
+                                            ['get', 'gas_reading'],
+                                            100,
+                                            '#00FF00',
+                                            1000,
+                                            '#FF0000'
+                                        ]
+                                    }
+                                });
+        
+                                // Add a layer to represent the device position data.
+                                map.addLayer({
+                                    'id': 'device_pos_layer',
+                                    'type': 'circle',
+                                    'source': 'device_pos', // reference the data source
+                                    'paint': {
+                                        // make circles larger as the user zooms from z12 to z22
+                                        'circle-radius': {
+                                        'base': 1.75,
+                                        'stops': [
+                                            [12, 3],
+                                            [22, 50]
+                                            ]
+                                        },
+                                        'circle-color': '#0000FF'
+                                    }
+                                });
+                            });
                         }
                         
-                        initializeMap();
+
                     </script>
                 </td>
             </tr>
             <tr height = "25" valign = "bottom">
                 <td colspan = "2" bgcolor = "DarkOrange">
                     <center>
-                        Copyright © 2021 Constantine Vavourakis
+                        Hosted on Amazon Web Services
                     </center>
                 </td>
             </tr>         
