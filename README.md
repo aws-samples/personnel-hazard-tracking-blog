@@ -1,5 +1,5 @@
 # Industrial Personnel & Hazard Tracking with Amazon Location Services
-Link to the AWS Blog: (link)
+Link to the AWS Blog: [Industrial Personnel & Hazard Tracking with Amazon Location Service](https://aws.amazon.com/blogs/industries/industrial-personnel-hazard-tracking-with-amazon-location-service/)
 
 ## Prerequisites
 
